@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lattice_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Bitcoin Core (testnet by default) ─────────────────────────────────────
+  bitcoin-core:
+    image: ruimarinho/bitcoin-core:26
+    container_name: lattice_bitcoin
+    restart: unless-stopped
+    ports:
+      - "18332:18332"   # testnet RPC
+      - "8332:8332"     # mainnet RPC (blocked by default)
+    volumes:
+      - bitcoin_data:/home/bitcoin/.bitcoin
+    command:
+      -testnet=1
+      -server=1
+      -rpcuser=${BITCOIN_RPC_USER:-lattice}
+      -rpcpassword=${BITCOIN_RPC_PASS:-changeme}
+      -rpcallowip=0.0.0.0/0
+      -rpcbind=0.0.0.0
+      -fallbackfee=0.0001
+      -txindex=1
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-testnet", "-rpcuser=${BITCOIN_RPC_USER:-lattice}", "-rpcpassword=${BITCOIN_RPC_PASS:-changeme}", "getblockchaininfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ── Lattice Keeper ─────────────────────────────────────────────────────────
+  lattice-keeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lattice_keeper
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+      - "9090:9090"     # Prometheus metrics (only active when DEBUG=true)
+    depends_on:
+      redis:
+        condition: service_healthy
+      bitcoin-core:
+        condition: service_healthy
+    environment:
+      LATTICE_API_KEY: ${LATTICE_API_KEY}                       # REQUIRED — set in .env
+      LATTICE_BTC_MAINNET: ${LATTICE_BTC_MAINNET:-false}
+      LATTICE_LIGHTNING_ENABLED: ${LATTICE_LIGHTNING_ENABLED:-false}
+      BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-lattice}
+      BITCOIN_RPC_PASS: ${BITCOIN_RPC_PASS:-changeme}
+      DOMAIN: ${DOMAIN:-lattice.example.com}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-20}
+      DEBUG: ${DEBUG:-false}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  redis_data:
+  bitcoin_data:
