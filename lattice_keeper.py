@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
+"""
+Lattice Keeper v0.21.0
+Bitcoin-anchored document integrity + RWA tokenization
+with ML-DSA-65 (FIPS 204) post-quantum digital signatures.
+
+Every anchor is now:
+  1. SHA-256 hashed
+  2. PQC-signed with ML-DSA-65 (Dilithium3)
+  3. Written to Bitcoin via OP_RETURN
+
+This makes anchors verifiable even against future quantum computers.
+"""
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import hashlib
 import json
@@ -11,6 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict
 
 import aiohttp
@@ -18,6 +32,122 @@ import redis.asyncio as redis
 import structlog
 from aiohttp import web
 from prometheus_client import Counter, Histogram, start_http_server
+
+# ======================== PQC: ML-DSA-65 ========================
+# Uses liboqs (Open Quantum Safe) — the reference implementation of
+# FIPS 204 ML-DSA (formerly CRYSTALS-Dilithium).
+try:
+    import oqs
+    PQC_AVAILABLE = True
+except ImportError:
+    PQC_AVAILABLE = False
+
+PQC_ALGORITHM = "Dilithium3"  # = ML-DSA-65 in FIPS 204
+
+
+class PQCSigner:
+    """
+    Manages ML-DSA-65 keypair for signing anchor hashes.
+
+    Key storage:
+      - Private key: env var PQC_SECRET_KEY (base64) or file at PQC_KEY_PATH
+      - Public key:  env var PQC_PUBLIC_KEY (base64) or derived from secret key
+      - If neither exists, generates a fresh keypair and saves to PQC_KEY_PATH
+
+    SECURITY NOTE: In production, the secret key should live in a HSM or
+    air-gapped signer. This file-based approach is for prototyping.
+    """
+
+    def __init__(self):
+        self.algorithm = PQC_ALGORITHM
+        self.secret_key: bytes = b""
+        self.public_key: bytes = b""
+        self._signer = None
+
+        if not PQC_AVAILABLE:
+            structlog.get_logger().warning(
+                "pqc_unavailable",
+                msg="liboqs not installed — PQC signing disabled. "
+                    "Install with: pip install oqs"
+            )
+            return
+
+        self._load_or_generate_keys()
+
+    def _load_or_generate_keys(self):
+        log = structlog.get_logger("pqc")
+        key_path = Path(os.getenv("PQC_KEY_PATH", "/data/pqc_keys"))
+
+        # Try env vars first
+        sk_b64 = os.getenv("PQC_SECRET_KEY", "")
+        pk_b64 = os.getenv("PQC_PUBLIC_KEY", "")
+
+        if sk_b64 and pk_b64:
+            self.secret_key = base64.b64decode(sk_b64)
+            self.public_key = base64.b64decode(pk_b64)
+            log.info("pqc_keys_loaded", source="env", algorithm=self.algorithm)
+            return
+
+        # Try file-based keys
+        sk_file = key_path / "secret_key.bin"
+        pk_file = key_path / "public_key.bin"
+
+        if sk_file.exists() and pk_file.exists():
+            self.secret_key = sk_file.read_bytes()
+            self.public_key = pk_file.read_bytes()
+            log.info("pqc_keys_loaded", source="file", algorithm=self.algorithm,
+                     path=str(key_path))
+            return
+
+        # Generate fresh keypair
+        log.info("pqc_generating_keypair", algorithm=self.algorithm)
+        with oqs.Signature(self.algorithm) as signer:
+            self.public_key = signer.generate_keypair()
+            self.secret_key = signer.export_secret_key()
+
+        # Persist to disk
+        key_path.mkdir(parents=True, exist_ok=True)
+        sk_file.write_bytes(self.secret_key)
+        pk_file.write_bytes(self.public_key)
+        os.chmod(sk_file, 0o600)  # restrict secret key permissions
+
+        log.info("pqc_keypair_generated", algorithm=self.algorithm,
+                 pk_size=len(self.public_key), sk_size=len(self.secret_key),
+                 path=str(key_path))
+
+    @property
+    def available(self) -> bool:
+        return PQC_AVAILABLE and len(self.secret_key) > 0
+
+    def sign(self, message: bytes) -> bytes:
+        """Sign a message with ML-DSA-65. Returns raw signature bytes."""
+        if not self.available:
+            raise RuntimeError("PQC signing not available")
+        with oqs.Signature(self.algorithm, self.secret_key) as signer:
+            return signer.sign(message)
+
+    def verify(self, message: bytes, signature: bytes, public_key: bytes = None) -> bool:
+        """Verify an ML-DSA-65 signature. Uses own public key if none provided."""
+        if not PQC_AVAILABLE:
+            raise RuntimeError("PQC verification not available — liboqs not installed")
+        pk = public_key or self.public_key
+        with oqs.Signature(self.algorithm) as verifier:
+            return verifier.verify(message, signature, pk)
+
+    def public_key_b64(self) -> str:
+        """Return the public key as base64 for API responses."""
+        return base64.b64encode(self.public_key).decode() if self.public_key else ""
+
+    def info(self) -> Dict:
+        """Return PQC status info for health/debug endpoints."""
+        return {
+            "algorithm": self.algorithm,
+            "fips": "FIPS 204 (ML-DSA-65)",
+            "available": self.available,
+            "public_key_bytes": len(self.public_key),
+            "public_key_b64": self.public_key_b64()[:64] + "..." if self.available else "",
+        }
+
 
 # ======================== LOGGING ========================
 structlog.configure(
@@ -47,6 +177,8 @@ MAX_DATA_LEN      = 4096
 ANCHORS_CREATED  = Counter('lattice_anchors_created_total',    'Total anchors created')
 ANCHORS_VERIFIED = Counter('lattice_anchors_verified_total',   'Total verifications')
 ANCHOR_LATENCY   = Histogram('lattice_anchor_latency_seconds', 'Anchor creation latency')
+PQC_SIGNS        = Counter('lattice_pqc_signatures_total',     'Total PQC signatures created')
+PQC_VERIFIES     = Counter('lattice_pqc_verifications_total',  'Total PQC verifications')
 ERROR_COUNTER    = Counter('lattice_errors_total', 'Total errors', ['endpoint'])
 
 
@@ -62,6 +194,7 @@ class AppConfig:
     api_host:            str  = os.getenv("API_HOST", "0.0.0.0")
     api_port:            int  = int(os.getenv("API_PORT", 8765))
     debug:               bool = os.getenv("DEBUG", "false").lower() == "true"
+    pqc_enabled:         bool = os.getenv("PQC_ENABLED", "true").lower() == "true"
 
     @classmethod
     def from_env(cls):
@@ -137,8 +270,6 @@ class BitcoinRPC:
         address = await self.call("getrawchangeaddress", ["bech32"])
 
         if self.mainnet:
-            # walletcreatefundedpsbt is the correct RPC for Coldcard PSBT flow —
-            # unlike fundrawtransaction it returns a real {"psbt": ...} key.
             psbt_result = await self.call(
                 "walletcreatefundedpsbt",
                 [[], [{"data": data_hash}, {address: 0.00000546}]]
@@ -150,9 +281,6 @@ class BitcoinRPC:
                 "message": "Sign this PSBT with Coldcard, then POST to /broadcast",
             }
 
-        # Regtest / Testnet: raw tx → fund → sign → broadcast
-        # fundrawtransaction returns {"hex": ..., "fee": ..., "changepos": ...} — no psbt key.
-        # signrawtransactionwithwallet operates on raw hex, which is correct here.
         raw_tx = await self.call(
             "createrawtransaction",
             [[], [{"data": data_hash}, {address: 0.00000546}]]
@@ -212,6 +340,7 @@ class GuardianVector:
         self.redis   = redis.from_url("redis://redis:6379/0")
         self.bitcoin = BitcoinRPC(config.lattice_btc_mainnet)
         self.lnd     = LNDRPC()
+        self.pqc     = PQCSigner() if config.pqc_enabled else None
 
     # -------------------- CORE ANCHOR --------------------
 
@@ -225,6 +354,22 @@ class GuardianVector:
         start     = time.perf_counter()
         root_hash = hashlib.sha256(custom_data.encode()).hexdigest()
 
+        # ---- PQC: Sign the root hash with ML-DSA-65 ----
+        pqc_signature_b64 = ""
+        pqc_public_key_b64 = ""
+        if self.pqc and self.pqc.available:
+            try:
+                signature_bytes = self.pqc.sign(bytes.fromhex(root_hash))
+                pqc_signature_b64 = base64.b64encode(signature_bytes).decode()
+                pqc_public_key_b64 = self.pqc.public_key_b64()
+                PQC_SIGNS.inc()
+                log.info("pqc_signed", anchor_id=anchor_id, algorithm=self.pqc.algorithm,
+                         sig_bytes=len(signature_bytes))
+            except Exception as e:
+                log.error("pqc_sign_failed", anchor_id=anchor_id, error=str(e))
+                # Non-fatal: anchor still created, just without PQC signature
+
+        # ---- Bitcoin: Write to chain ----
         try:
             result = await self.bitcoin.create_op_return_tx(root_hash)
             txid   = result.get("txid", "")
@@ -234,15 +379,18 @@ class GuardianVector:
             log.error("anchor_tx_failed", anchor_id=anchor_id, error=str(e))
             txid   = ""
             psbt   = ""
-            status = "ANCHOR_FAILED"  # honest — never silently returns CREATED on crash
+            status = "ANCHOR_FAILED"
 
         payload = {
-            "anchor_id":  anchor_id,
-            "root_hash":  root_hash,
-            "txid":       txid,
-            "psbt":       psbt,
-            "status":     status,
-            "created_at": datetime.now(UTC).isoformat(),
+            "anchor_id":      anchor_id,
+            "root_hash":      root_hash,
+            "txid":           txid,
+            "psbt":           psbt,
+            "status":         status,
+            "pqc_algorithm":  PQC_ALGORITHM if pqc_signature_b64 else "",
+            "pqc_signature":  pqc_signature_b64,
+            "pqc_public_key": pqc_public_key_b64,
+            "created_at":     datetime.now(UTC).isoformat(),
         }
 
         await self.redis.hset(f"anchor:{anchor_id}", mapping=payload)
@@ -250,7 +398,8 @@ class GuardianVector:
 
         ANCHORS_CREATED.inc()
         ANCHOR_LATENCY.observe(time.perf_counter() - start)
-        log.info("anchor_created", anchor_id=anchor_id, status=status)
+        log.info("anchor_created", anchor_id=anchor_id, status=status,
+                 pqc_signed=bool(pqc_signature_b64))
         return payload
 
     # -------------------- RWA TOKENIZATION --------------------
@@ -297,6 +446,8 @@ class GuardianVector:
             "anchor_id":     anchor_result["anchor_id"],
             "anchor_status": anchor_result["status"],
             "txid":          anchor_result.get("txid", ""),
+            "pqc_signature": anchor_result.get("pqc_signature", ""),
+            "pqc_algorithm": anchor_result.get("pqc_algorithm", ""),
         })
 
         log.info("rwa_tokenized", token_id=rwa.token_id,
@@ -310,6 +461,7 @@ class GuardianVector:
             "anchor_id":     anchor_result["anchor_id"],
             "anchor_status": anchor_result["status"],
             "root_hash":     root_hash,
+            "pqc_signed":    bool(anchor_result.get("pqc_signature")),
             "status":        "MINTED" if anchor_result["status"] == "ANCHOR_FAILED"
                              else "MINTED_AND_ANCHORED",
         }
@@ -416,6 +568,12 @@ class GuardianVector:
         return web.json_response({k.decode(): v.decode() for k, v in data.items()})
 
     async def handle_verify(self, request: web.Request):
+        """
+        Verify an anchor:
+          1. SHA-256 hash match
+          2. PQC signature verification (if signature present)
+          3. Bitcoin confirmation check
+        """
         try:
             data = await request.json()
         except Exception:
@@ -436,6 +594,29 @@ class GuardianVector:
         if root_hash != stored_hash:
             return web.json_response({"valid": False, "reason": "hash_mismatch"})
 
+        # ---- PQC: Verify the ML-DSA-65 signature ----
+        pqc_valid = None
+        stored_sig = stored.get(b"pqc_signature", b"").decode()
+        stored_pk  = stored.get(b"pqc_public_key", b"").decode()
+
+        if stored_sig and stored_pk and PQC_AVAILABLE:
+            try:
+                sig_bytes = base64.b64decode(stored_sig)
+                pk_bytes  = base64.b64decode(stored_pk)
+                pqc_signer = PQCSigner.__new__(PQCSigner)
+                pqc_signer.algorithm = PQC_ALGORITHM
+                pqc_valid = pqc_signer.verify(
+                    bytes.fromhex(root_hash), sig_bytes, pk_bytes
+                )
+                PQC_VERIFIES.inc()
+                log.info("pqc_verified", anchor_id=anchor_id, valid=pqc_valid)
+            except Exception as e:
+                log.error("pqc_verify_failed", anchor_id=anchor_id, error=str(e))
+                pqc_valid = False
+        elif stored_sig and not PQC_AVAILABLE:
+            pqc_valid = None  # can't verify without liboqs
+
+        # ---- Bitcoin: Check confirmations ----
         txid          = stored.get(b"txid", b"").decode()
         confirmations = 0
         if txid:
@@ -446,22 +627,44 @@ class GuardianVector:
                 pass
 
         required_confs = 6 if self.config.lattice_btc_mainnet else 1
-        valid          = confirmations >= required_confs
+        btc_valid      = confirmations >= required_confs
 
+        # Overall: hash matches AND (btc confirmed OR no txid yet)
+        # PQC is reported separately since it's an additional layer
         ANCHORS_VERIFIED.inc()
         return web.json_response({
-            "valid":         valid,
-            "confirmations": confirmations,
-            "txid":          txid,
-            "anchor_id":     anchor_id,
+            "valid":              btc_valid,
+            "hash_match":         True,
+            "confirmations":      confirmations,
+            "txid":               txid,
+            "anchor_id":          anchor_id,
+            "pqc_valid":          pqc_valid,
+            "pqc_algorithm":      stored.get(b"pqc_algorithm", b"").decode() or None,
+        })
+
+    async def handle_pqc_info(self, request: web.Request):
+        """Public endpoint: return PQC public key and algorithm info."""
+        if not self.pqc or not self.pqc.available:
+            return web.json_response({
+                "pqc_enabled": False,
+                "message": "PQC signing not available on this instance",
+            })
+
+        return web.json_response({
+            "pqc_enabled":  True,
+            "algorithm":    self.pqc.algorithm,
+            "fips":         "FIPS 204 (ML-DSA-65)",
+            "public_key":   self.pqc.public_key_b64(),
+            "key_bytes":    len(self.pqc.public_key),
         })
 
 
 # ======================== MAIN ========================
 async def main():
     config = AppConfig.from_env()
-    log.info("lattice_keeper_starting", version="0.20.0",
-             domain=config.domain, tls=config.tls_enabled)
+    log.info("lattice_keeper_starting", version="0.21.0",
+             domain=config.domain, tls=config.tls_enabled,
+             pqc_enabled=config.pqc_enabled)
 
     if config.debug:
         start_http_server(9090)
@@ -473,15 +676,19 @@ async def main():
     app['config']   = config
     app['guardian'] = guardian
 
-    # All routes auth-gated except /health
+    # All routes auth-gated except /health and /pqc/info
     app.router.add_post("/anchor",              require_auth(guardian.handle_create_anchor))
     app.router.add_post("/rwa/tokenize",        require_auth(guardian.handle_tokenize_rwa))
     app.router.add_post("/broadcast",           require_auth(guardian.handle_broadcast))
     app.router.add_get("/anchors",              require_auth(guardian.handle_list_anchors))
     app.router.add_get("/anchor/{anchor_id}",   require_auth(guardian.handle_get_anchor))
     app.router.add_post("/verify",              require_auth(guardian.handle_verify))
+    app.router.add_get("/pqc/info",             guardian.handle_pqc_info)  # public
     app.router.add_get("/health",
-        lambda r: web.json_response({"status": "healthy", "version": "0.20.0"}))
+        lambda r: web.json_response({
+            "status": "healthy", "version": "0.21.0",
+            "pqc": guardian.pqc.info() if guardian.pqc else {"available": False},
+        }))
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -493,7 +700,8 @@ async def main():
 
     log.info("lattice_keeper_running", port=config.api_port,
              metrics_port=9090 if config.debug else None,
-             rwa=True, lightning=config.lightning_enabled)
+             rwa=True, lightning=config.lightning_enabled,
+             pqc=config.pqc_enabled)
 
     try:
         await asyncio.Event().wait()

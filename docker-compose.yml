@@ -59,6 +59,8 @@ services:
         condition: service_healthy
       bitcoin-core:
         condition: service_healthy
+    volumes:
+      - pqc_keys:/data/pqc_keys
     environment:
       LATTICE_API_KEY: ${LATTICE_API_KEY}                       # REQUIRED — set in .env
       LATTICE_BTC_MAINNET: ${LATTICE_BTC_MAINNET:-false}
@@ -67,6 +69,8 @@ services:
       BITCOIN_RPC_PASS: ${BITCOIN_RPC_PASS:-changeme}
       DOMAIN: ${DOMAIN:-lattice.example.com}
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-20}
+      PQC_ENABLED: ${PQC_ENABLED:-true}
+      PQC_KEY_PATH: /data/pqc_keys
       DEBUG: ${DEBUG:-false}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
@@ -77,3 +81,4 @@ services:
 volumes:
   redis_data:
   bitcoin_data:
+  pqc_keys:

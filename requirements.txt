@@ -1,0 +1,5 @@
+aiohttp>=3.9
+redis[hiredis]>=5.0
+structlog>=24.0
+prometheus-client>=0.20
+liboqs-python>=0.10.0
